@@ -1,0 +1,19 @@
+# big artifacts (do NOT commit)
+data/
+runs/
+models/
+matgl_models/
+gen_*/
+
+# common large files
+*.pt
+*.pth
+*.ckpt
+*.cif
+*.log
+*.csv
+
+# keep small, human-readable summaries
+!reports/
+!reports/*.md
+!reports/*.csv
