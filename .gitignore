@@ -17,3 +17,9 @@ gen_*/
 !reports/
 !reports/*.md
 !reports/*.csv
+
+# generated local artifacts
+local_tokenizer/
+outputs/
+__pycache__/
+*.pyc
