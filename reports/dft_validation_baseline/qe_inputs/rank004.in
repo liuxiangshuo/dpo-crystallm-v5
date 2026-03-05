@@ -1,0 +1,45 @@
+&CONTROL
+  calculation = 'relax',
+  outdir = './tmp/',
+  prefix = 'rank004',
+  pseudo_dir = './pseudo/',
+  tprnfor = .TRUE.,
+  tstress = .TRUE.,
+/
+&SYSTEM
+  degauss = 0.01,
+  ecutrho = 400.0,
+  ecutwfc = 50.0,
+  occupations = 'smearing',
+  smearing = 'gaussian',
+  ibrav = 0,
+  nat = 7,
+  ntyp = 4,
+/
+&ELECTRONS
+  conv_thr = 1d-06,
+  mixing_beta = 0.7,
+/
+&IONS
+/
+&CELL
+/
+ATOMIC_SPECIES
+  Fe  55.8450 Fe.UPF
+  Li  6.9410 Li.UPF
+  O  15.9994 O.UPF
+  P  30.9738 P.UPF
+ATOMIC_POSITIONS crystal
+  Li 0.156500 0.527700 0.757300
+  Fe 0.165800 0.033200 0.759800
+  P 0.095200 0.241400 0.257000
+  O 0.056500 0.254600 0.566100
+  O 0.122900 0.766400 0.685300
+  O 0.159000 0.437100 0.153100
+  O 0.168100 0.048500 0.157300
+K_POINTS automatic
+  4 4 4 0 0 0
+CELL_PARAMETERS angstrom
+  10.508800 0.000000 0.000000
+  0.000000 6.387700 0.000000
+  0.000000 0.000000 4.890200

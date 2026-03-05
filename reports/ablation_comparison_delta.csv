@@ -1,0 +1,6 @@
+experiment,loss_function,beta,learning_rate,training_steps,preference_pairs,label_smoothing,simpo_gamma,delta_stability_rate,delta_composition_hit_rate,delta_energy_mean,delta_energy_median,delta_energy_p10,delta_energy_p90,delta_energy_std,training_loss_reduction,pi_delta_end,positive_ratio
+exp_final_50k,dpo,0.1,5e-7,2000,5000,,,+0.0015,-0.0043,+0.000724,-0.007680,-0.001634,-0.006848,+0.016217,,,
+exp_ablation_dpo,dpo,2.5,1e-7,8000,15000,,,+0.0004,+0.0007,+0.003568,-0.001155,-0.001371,+0.002652,-0.014460,-0.154,0.050,54%
+exp_ablation_cdpo,cdpo,2.5,1e-7,8000,15000,0.1,,+0.0002,+0.0007,+0.002669,-0.001023,-0.001322,-0.000166,-0.013303,-0.128,0.045,54%
+exp_ablation_simpo,simpo,2.0,1e-7,8000,15000,,1.0,+0.0002,+0.0006,+0.003705,-0.000369,-0.001265,+0.006276,-0.019327,-0.222,0.053,58%
+exp_sft_stable,sft,,,,,,,,-0.0110,+0.0204,+0.078508,+0.048987,+0.000230,+0.100111,,,,

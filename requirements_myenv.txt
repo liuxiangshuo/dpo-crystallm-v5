@@ -1,0 +1,8 @@
+# Conda environment: myenv
+# Used for: CIF generation, validation, labeling, pair building, reporting
+torch>=2.0
+pymatgen>=2024.1.1
+tqdm
+matplotlib
+mp-api
+pandas

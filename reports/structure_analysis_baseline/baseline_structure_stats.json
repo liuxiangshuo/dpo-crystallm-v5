@@ -1,0 +1,88 @@
+{
+  "total": 5000,
+  "spacegroup_distribution": {
+    "P1": 5000
+  },
+  "crystal_system_distribution": {
+    "triclinic": 5000
+  },
+  "unique_spacegroups": 1,
+  "unique_formulas": 12,
+  "top10_formulas": {
+    "LiFePO4": 2764,
+    "LiFePO3": 1322,
+    "LiFePO2": 867,
+    "LiFePO5": 22,
+    "LiFe2PO4": 16,
+    "Li3Fe3(PO4)2": 2,
+    "Li2Fe(PO4)2": 2,
+    "Li3Fe2(PO5)2": 1,
+    "LiFe2(PO4)2": 1,
+    "LiFePO": 1
+  },
+  "lattice": {
+    "a": {
+      "mean": 7.5051,
+      "median": 7.7679,
+      "std": 2.1644,
+      "min": 0.706,
+      "max": 11.3216
+    },
+    "b": {
+      "mean": 6.6807,
+      "median": 6.1534,
+      "std": 1.4538,
+      "min": 4.1772,
+      "max": 12.2922
+    },
+    "c": {
+      "mean": 7.1925,
+      "median": 7.0488,
+      "std": 2.067,
+      "min": 4.5455,
+      "max": 11.9465
+    },
+    "alpha": {
+      "mean": 89.032,
+      "median": 90.0,
+      "std": 3.7693,
+      "min": 62.1977,
+      "max": 110.4661
+    },
+    "beta": {
+      "mean": 96.2133,
+      "median": 90.0,
+      "std": 11.5984,
+      "min": 74.6621,
+      "max": 129.5758
+    },
+    "gamma": {
+      "mean": 89.2105,
+      "median": 90.0,
+      "std": 3.1163,
+      "min": 62.231,
+      "max": 98.6539
+    }
+  },
+  "volume": {
+    "mean": 315.7594,
+    "median": 306.3051,
+    "std": 34.8729,
+    "min": 20.4938,
+    "max": 510.9836
+  },
+  "density": {
+    "mean": 0.9424,
+    "median": 0.8117,
+    "std": 0.3445,
+    "min": 0.597,
+    "max": 11.4862
+  },
+  "n_atoms": {
+    "mean": 7.836,
+    "median": 7.0,
+    "std": 3.235,
+    "min": 4.0,
+    "max": 17.0
+  }
+}

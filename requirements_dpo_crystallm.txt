@@ -1,0 +1,4 @@
+# Conda environment: dpo_crystallm
+# Used for: DPO training
+torch>=2.0
+tqdm
