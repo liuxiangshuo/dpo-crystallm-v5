@@ -179,6 +179,8 @@ def main():
     # This ensures the composite reward is well-defined even if user inputs are not normalized
     # Note: If weights already sum to 1.0 (e.g., 0.70 + 0.10 + 0.10 + 0.10), this is a no-op
     w_sum = args.w_proxy + args.w_geom + args.w_comp + args.w_novel
+    if w_sum <= 0:
+        raise ValueError(f"Reward weights sum to {w_sum}; at least one weight must be positive.")
     if abs(w_sum - 1.0) > 0.001:
         print(f"WARNING: Weights sum to {w_sum:.3f}, normalizing to 1.0")
     w_proxy = args.w_proxy / w_sum

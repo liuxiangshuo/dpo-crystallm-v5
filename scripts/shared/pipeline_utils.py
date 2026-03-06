@@ -237,13 +237,13 @@ def merge_eval_csv(scored_dir: str, conda_env: Optional[str] = None) -> bool:
     try:
         # Load labels
         labels = {}
-        with open(labels_path, "r") as f:
+        with open(labels_path, "r", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 labels[row["file"]] = row
 
         # Load scores
         scores = {}
-        with open(scores_path, "r") as f:
+        with open(scores_path, "r", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 v = row.get("score_e_per_atom", "").strip()
                 if v:
@@ -253,7 +253,7 @@ def merge_eval_csv(scored_dir: str, conda_env: Optional[str] = None) -> bool:
         fieldnames = ["file", "valid", "formula", "target", "hit_target",
                       "score_e_per_atom", "error"]
 
-        with open(out_path, "w", newline="") as f:
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
 

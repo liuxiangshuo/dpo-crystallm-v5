@@ -320,7 +320,7 @@ def main():
 
         (loss / args.grad_accum_steps).backward()
         accum_loss += loss.item()
-        accum_count += args.batch_size
+        accum_count += 1
 
         # --- Optimizer step (every grad_accum_steps) ---
         if step % args.grad_accum_steps == 0 or step == args.steps:

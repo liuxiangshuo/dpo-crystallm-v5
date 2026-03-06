@@ -78,6 +78,11 @@ GEN_BATCH_SIZE=${GEN_BATCH_SIZE:-16}
 MATGL_FIX_LD_LIBRARY_PATH=${MATGL_FIX_LD_LIBRARY_PATH:-0}
 export MATGL_FIX_LD_LIBRARY_PATH
 
+# Conda environment names (overridable via config.sh exports)
+CONDA_ENV_MYENV=${CONDA_ENV_MYENV:-myenv}
+CONDA_ENV_MATGL=${CONDA_ENV_MATGL:-matgl_env}
+CONDA_ENV_DPO=${CONDA_ENV_DPO:-dpo_crystallm}
+
 # Quality gates
 MIN_VALID_CIFS=${MIN_VALID_CIFS:-1000}
 MIN_SCORED_CIFS=${MIN_SCORED_CIFS:-800}
@@ -286,17 +291,17 @@ echo "  DPO_LR:                $DPO_LR"
 echo "  DPO_STEPS:             $DPO_STEPS"
 echo "  SCORE_FAILED_GATE_MODE:$SCORE_FAILED_GATE_MODE (threshold=$SCORE_FAILED_RATE_FAIL)"
 echo ""
+# ---- Checkpoint / Resume support ----
+CHECKPOINT_FILE="$EXP_DIR/.checkpoint"
+RESUME=${RESUME:-0}
+CLEAN=${CLEAN:-0}
+
 echo "--- Control Flags ---"
 echo "  RESUME:                $RESUME"
 echo "  CLEAN:                 $CLEAN"
 echo ""
 echo "=== END CONFIGURATION ==="
 echo ""
-
-# ---- Checkpoint / Resume support ----
-CHECKPOINT_FILE="$EXP_DIR/.checkpoint"
-RESUME=${RESUME:-0}
-CLEAN=${CLEAN:-0}
 
 mark_step_done() {
     local phase="$1"
@@ -332,6 +337,9 @@ cleanup_phase() {
                 rm -rf "$REPORT_DIR/three_way_$b"
                 for t in "${TARGET_LIST[@]}"; do rm -rf "$EXP_DIR/$t/dpo_$b"; done
             done
+            ;;
+        6)
+            rm -rf "$REPORT_DIR/visualizations"
             ;;
     esac
 }
@@ -505,6 +513,26 @@ is_phase5_done() {
     return 0
 }
 
+# Phase 6: Structure visualisation
+is_phase6_done() {
+    local viz_dir="$REPORT_DIR/visualizations"
+    if [ ! -f "$viz_dir/manifest.json" ]; then
+        echo "[validate] Phase 6: missing visualizations/manifest.json"
+        return 1
+    fi
+    local img_count
+    img_count=$(python3 -c "
+from pathlib import Path
+exts = {'.png', '.jpg', '.jpeg', '.webp', '.gif'}
+print(sum(1 for p in Path('$viz_dir').rglob('*') if p.suffix.lower() in exts))
+" 2>/dev/null || echo 0)
+    if [ "$img_count" -lt 1 ]; then
+        echo "[validate] Phase 6: no rendered images found under $viz_dir"
+        return 1
+    fi
+    return 0
+}
+
 # Main should_run function with safe resume
 should_run() {
     local step="$1"; local last; last=$(last_done)
@@ -545,6 +573,12 @@ should_run() {
             5)
                 if ! is_phase5_done; then
                     echo "[resume] Phase 5 marker exists (last=$last) but artifacts invalid; rerunning."
+                    return 0
+                fi
+                ;;
+            6)
+                if ! is_phase6_done; then
+                    echo "[resume] Phase 6 marker exists (last=$last) but artifacts invalid; rerunning."
                     return 0
                 fi
                 ;;
@@ -694,7 +728,7 @@ for target in "${TARGET_LIST[@]}"; do
 
     # Generate
     export MAX_RETRIES
-    conda run -n myenv python "$SCRIPT_DIR/40_generate_cifs_crystallm.py" \
+    conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/40_generate_cifs_crystallm.py" \
         --ckpt_dir "$CRYSTALLM_CKPT_DIR" \
         --pkg_dir "$CRYSTALLM_PKG_DIR" \
         --out_dir "$CIF_DIR" \
@@ -709,23 +743,29 @@ for target in "${TARGET_LIST[@]}"; do
         $DIVERSITY_ARGS
 
     # Validate
-    conda run -n myenv python "$SCRIPT_DIR/11_validate_cifs.py" \
+    conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/11_validate_cifs.py" \
         --in_dir "$CIF_DIR" --out_dir "$SCORED_DIR"
 
     # Quality gate: valid CIF count
+    N_GENERATED=$(count_cif_files "$CIF_DIR")
     N_VALID=$(count_cif_files "$VALID_DIR")
+    echo "  Generated CIFs: $N_GENERATED / $NUM_SAMPLES requested"
     echo "  Valid CIFs: $N_VALID (gate: $MIN_VALID_CIFS)"
+    if [ "$N_GENERATED" -gt 0 ] && [ "$N_GENERATED" -lt $((NUM_SAMPLES / 2)) ]; then
+        echo "WARNING: Only $N_GENERATED/$NUM_SAMPLES CIFs generated for $target — generation may have crashed early."
+        echo "         Resume may skip this phase if $N_VALID >= $MIN_VALID_CIFS. Consider CLEAN=1 rerun."
+    fi
     if [ "$N_VALID" -lt "$MIN_VALID_CIFS" ]; then
         echo "ERROR: Too few valid CIFs for $target ($N_VALID < $MIN_VALID_CIFS). Aborting."
         exit 1
     fi
 
     # Label
-    conda run -n myenv python "$SCRIPT_DIR/12_label_cifs.py" \
+    conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/12_label_cifs.py" \
         --in_dir "$CIF_DIR" --out_csv "$SCORED_DIR/labels.csv" --target "$target"
 
     # MatGL scoring
-    conda run -n matgl_env bash -c "
+    conda run -n "$CONDA_ENV_MATGL" bash -c "
         [ \"\$MATGL_FIX_LD_LIBRARY_PATH\" = '1' ] && export LD_LIBRARY_PATH=\"\$CONDA_PREFIX/lib:\$LD_LIBRARY_PATH\"
         python $SCRIPT_DIR/35_score_dir_matgl.py --in_dir $VALID_DIR --out_csv $SCORED_DIR/ehull_scores.csv
     "
@@ -745,14 +785,14 @@ for target in "${TARGET_LIST[@]}"; do
     merge_eval_csv "$SCORED_DIR"
 
     # Ehull estimation
-    conda run -n myenv python "$SCRIPT_DIR/36_estimate_ehull.py" \
+    conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/36_estimate_ehull.py" \
         --scores_csv "$SCORED_DIR/ehull_scores.csv" \
         --out_csv "$SCORED_DIR/ehull_estimates.csv" \
         || echo "WARNING: Ehull failed for $target"
 
     # Composite reward
     echo "Computing composite reward for $target ..."
-    conda run -n myenv python "$SCRIPT_DIR/48_compute_composite_reward.py" \
+    conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/48_compute_composite_reward.py" \
         --scores_csv "$SCORED_DIR/ehull_scores.csv" \
         --cif_dir "$CIF_DIR" \
         --target "$target" \
@@ -818,7 +858,7 @@ fi
 SFT_JSONL="$SFT_DATA_DIR/sft_data.jsonl"
 if [ ! -f "$SFT_JSONL" ] || [ ! -s "$SFT_JSONL" ]; then
     echo "Preparing multi-composition SFT data ..."
-    conda run -n myenv python "$SCRIPT_DIR/47_prepare_sft_data.py" \
+    conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/47_prepare_sft_data.py" \
         --ehull_csv "$EHULL_CSVS" \
         --cif_dir "$CIF_DIRS" \
         --pkg_dir "$CRYSTALLM_PKG_DIR" \
@@ -862,7 +902,7 @@ for branch in "${BRANCH_LIST[@]}"; do
         [ -n "$B_LORA_TARGETS" ] && LORA_ARGS="$LORA_ARGS --lora_target_names $B_LORA_TARGETS"
     fi
 
-    if ! conda run -n dpo_crystallm python "$SCRIPT_DIR/33_train_sft_crystallm.py" \
+    if ! conda run -n "$CONDA_ENV_DPO" python "$SCRIPT_DIR/33_train_sft_crystallm.py" \
         --data_jsonl "$SFT_JSONL" \
         --ckpt_dir "$CRYSTALLM_CKPT_DIR" \
         --pkg_dir "$CRYSTALLM_PKG_DIR" \
@@ -932,7 +972,7 @@ for branch in "${BRANCH_LIST[@]}"; do
         [ -n "$TEMPERATURE_RANGE" ] && DIVERSITY_ARGS="$DIVERSITY_ARGS --temperature_range $TEMPERATURE_RANGE"
         [ -n "$TOP_K_RANGE" ] && DIVERSITY_ARGS="$DIVERSITY_ARGS --top_k_range $TOP_K_RANGE"
 
-        conda run -n myenv python "$SCRIPT_DIR/40_generate_cifs_crystallm.py" \
+        conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/40_generate_cifs_crystallm.py" \
             --ckpt_dir "$SFT_CKPT_FILE" \
             --pkg_dir "$CRYSTALLM_PKG_DIR" \
             --out_dir "$CIF_DIR" \
@@ -946,12 +986,16 @@ for branch in "${BRANCH_LIST[@]}"; do
             --device cuda \
             $DIVERSITY_ARGS
 
-        conda run -n myenv python "$SCRIPT_DIR/11_validate_cifs.py" \
+        conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/11_validate_cifs.py" \
             --in_dir "$CIF_DIR" --out_dir "$SCORED_DIR"
 
         # Validity gate
         TOTAL_GEN=$(count_cif_files "$CIF_DIR")
         TOTAL_VALID=$(count_cif_files "$VALID_DIR")
+        echo "  Generated CIFs: $TOTAL_GEN / $NUM_SAMPLES requested"
+        if [ "$TOTAL_GEN" -gt 0 ] && [ "$TOTAL_GEN" -lt $((NUM_SAMPLES / 2)) ]; then
+            echo "  WARNING: Only $TOTAL_GEN/$NUM_SAMPLES CIFs generated for SFT[$branch] $target — generation may have crashed early."
+        fi
         if [ "$TOTAL_GEN" -gt 0 ]; then
             VALIDITY_CHECK=$(python3 -c "valid=$TOTAL_VALID; total=$TOTAL_GEN; pct=100*valid/total if total else 0.0; print(f'{pct:.1f} {1 if pct < 50 else 0}')")
             read -r VALID_PCT VALID_LT50 <<< "$VALIDITY_CHECK"
@@ -965,9 +1009,9 @@ for branch in "${BRANCH_LIST[@]}"; do
             exit 1
         fi
 
-        conda run -n myenv python "$SCRIPT_DIR/12_label_cifs.py" \
+        conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/12_label_cifs.py" \
             --in_dir "$CIF_DIR" --out_csv "$SCORED_DIR/labels.csv" --target "$target"
-        conda run -n matgl_env bash -c "
+        conda run -n "$CONDA_ENV_MATGL" bash -c "
             [ \"\$MATGL_FIX_LD_LIBRARY_PATH\" = '1' ] && export LD_LIBRARY_PATH=\"\$CONDA_PREFIX/lib:\$LD_LIBRARY_PATH\"
             python $SCRIPT_DIR/35_score_dir_matgl.py --in_dir $VALID_DIR --out_csv $SCORED_DIR/ehull_scores.csv
         "
@@ -986,12 +1030,12 @@ for branch in "${BRANCH_LIST[@]}"; do
 
         merge_eval_csv "$SCORED_DIR"
 
-        conda run -n myenv python "$SCRIPT_DIR/36_estimate_ehull.py" \
+        conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/36_estimate_ehull.py" \
             --scores_csv "$SCORED_DIR/ehull_scores.csv" \
             --out_csv "$SCORED_DIR/ehull_estimates.csv" \
             || echo "WARNING: Ehull failed for $target (SFT[$branch])"
 
-        conda run -n myenv python "$SCRIPT_DIR/48_compute_composite_reward.py" \
+        conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/48_compute_composite_reward.py" \
             --scores_csv "$SCORED_DIR/ehull_scores.csv" \
             --cif_dir "$CIF_DIR" \
             --target "$target" \
@@ -1013,7 +1057,7 @@ for branch in "${BRANCH_LIST[@]}"; do
 
         PAIRS_DIR="$TARGET_DIR/pairs"
         mkdir -p "$PAIRS_DIR"
-        if conda run -n myenv python "$SCRIPT_DIR/41_build_pairs_with_token_filter.py" \
+        if conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/41_build_pairs_with_token_filter.py" \
             --labels_csv "$SCORED_DIR/labels.csv" \
             --scores_csv "$SCORED_DIR/ehull_scores.csv" \
             --reward_csv "$SCORED_DIR/composite_reward.csv" \
@@ -1086,7 +1130,6 @@ for branch in "${BRANCH_LIST[@]}"; do
     echo ""
     echo "==== DPO for branch: $branch ===="
 
-    PAIR_DIRS=""
     ACTIVE_TARGETS=()
     for target in "${TARGET_LIST[@]}"; do
         target=$(echo "$target" | xargs)
@@ -1096,7 +1139,6 @@ for branch in "${BRANCH_LIST[@]}"; do
         debug_log "pre-fix-1" "H1" "run_sft_rl_pipeline.sh:PHASE4_TARGET_FILTER" "Phase4 pair count before MIN_PAIRS filter" "{\"branch\":\"$branch\",\"target\":\"$target\",\"pair_count\":$PAIR_COUNT,\"min_pairs\":$MIN_PAIRS,\"dpo_total_pairs\":$DPO_TOTAL_PAIRS}"
         # #endregion
         if [ "$PAIR_COUNT" -ge "$MIN_PAIRS" ]; then
-            PAIR_DIRS="${PAIR_DIRS:+$PAIR_DIRS,}$EXP_DIR/$target/sft_$branch"
             ACTIVE_TARGETS+=("$target")
             echo "  $target [$branch]: pairs=$PAIR_COUNT (>= $MIN_PAIRS)"
         elif [ -f "$PAIR_FILE" ] && [ -s "$PAIR_FILE" ]; then
@@ -1106,7 +1148,7 @@ for branch in "${BRANCH_LIST[@]}"; do
         fi
     done
 
-    if [ -z "$PAIR_DIRS" ]; then
+    if [ "${#ACTIVE_TARGETS[@]}" -eq 0 ]; then
         echo "ERROR: No targets produced valid pairs for branch=$branch. Skipping branch."
         continue
     fi
@@ -1156,7 +1198,7 @@ for branch in "${BRANCH_LIST[@]}"; do
     debug_log "pre-fix-1" "H1" "run_sft_rl_pipeline.sh:PHASE4_ACTIVE_TARGETS" "Active targets selected for DPO merge" "{\"branch\":\"$branch\",\"active_targets\":\"$TARGETS_CSV\",\"active_count\":${#ACTIVE_TARGETS[@]},\"total_targets\":${#TARGET_LIST[@]},\"dpo_total_pairs\":$DPO_TOTAL_PAIRS}"
     # #endregion
     # Use shared pair_merge.py module for pair merging
-    if ! conda run -n myenv python "$SCRIPT_DIR/shared/pair_merge.py" \
+    if ! conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/shared/pair_merge.py" \
             --exp_dir "$EXP_DIR" \
             --targets "$TARGETS_CSV" \
             --branch "$branch" \
@@ -1205,7 +1247,7 @@ for branch in "${BRANCH_LIST[@]}"; do
     fi
 
     echo "Training DPO[$branch] on SFT checkpoint ..."
-    conda run -n dpo_crystallm python "$SCRIPT_DIR/32_train_dpo_crystallm.py" \
+    conda run -n "$CONDA_ENV_DPO" python "$SCRIPT_DIR/32_train_dpo_crystallm.py" \
         --pairs "$DPO_DIR/merged_pairs.jsonl" \
         --ckpt_dir "$SFT_CKPT_FILE" \
         --pkg_dir "$CRYSTALLM_PKG_DIR" \
@@ -1304,7 +1346,7 @@ for branch in "${BRANCH_LIST[@]}"; do
         [ -n "$TEMPERATURE_RANGE" ] && DIVERSITY_ARGS="$DIVERSITY_ARGS --temperature_range $TEMPERATURE_RANGE"
         [ -n "$TOP_K_RANGE" ] && DIVERSITY_ARGS="$DIVERSITY_ARGS --top_k_range $TOP_K_RANGE"
 
-        if ! conda run -n myenv python "$SCRIPT_DIR/40_generate_cifs_crystallm.py" \
+        if ! conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/40_generate_cifs_crystallm.py" \
             --ckpt_dir "$DPO_FINAL_CKPT" \
             --pkg_dir "$CRYSTALLM_PKG_DIR" \
             --out_dir "$CIF_DIR" \
@@ -1321,16 +1363,16 @@ for branch in "${BRANCH_LIST[@]}"; do
             continue
         fi
 
-        if ! conda run -n myenv python "$SCRIPT_DIR/11_validate_cifs.py" \
+        if ! conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/11_validate_cifs.py" \
             --in_dir "$CIF_DIR" --out_dir "$SCORED_DIR"; then
             echo "WARNING: CIF validation failed for $target (DPO[$branch]). Continuing with empty validation."
         fi
-        if ! conda run -n myenv python "$SCRIPT_DIR/12_label_cifs.py" \
+        if ! conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/12_label_cifs.py" \
             --in_dir "$CIF_DIR" --out_csv "$SCORED_DIR/labels.csv" --target "$target"; then
             echo "ERROR: CIF labeling failed for $target (DPO[$branch]). Skipping target."
             continue
         fi
-        if ! conda run -n matgl_env bash -c "
+        if ! conda run -n "$CONDA_ENV_MATGL" bash -c "
             [ \"\$MATGL_FIX_LD_LIBRARY_PATH\" = '1' ] && export LD_LIBRARY_PATH=\"\$CONDA_PREFIX/lib:\$LD_LIBRARY_PATH\"
             python $SCRIPT_DIR/35_score_dir_matgl.py --in_dir $VALID_DIR --out_csv $SCORED_DIR/ehull_scores.csv
         "; then
@@ -1353,12 +1395,12 @@ for branch in "${BRANCH_LIST[@]}"; do
             echo "WARNING: eval.csv merge failed for $target (DPO[$branch]). Continuing."
         fi
 
-        conda run -n myenv python "$SCRIPT_DIR/36_estimate_ehull.py" \
+        conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/36_estimate_ehull.py" \
             --scores_csv "$SCORED_DIR/ehull_scores.csv" \
             --out_csv "$SCORED_DIR/ehull_estimates.csv" \
             || echo "WARNING: Ehull failed for $target (DPO[$branch])"
 
-        conda run -n myenv python "$SCRIPT_DIR/48_compute_composite_reward.py" \
+        conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/48_compute_composite_reward.py" \
             --scores_csv "$SCORED_DIR/ehull_scores.csv" \
             --cif_dir "$CIF_DIR" \
             --target "$target" \
@@ -1395,7 +1437,7 @@ for branch in "${BRANCH_LIST[@]}"; do
         TARGET_LIST_STR="${TARGET_LIST_STR:+$TARGET_LIST_STR,}$target"
     done
 
-    if conda run -n myenv python "$SCRIPT_DIR/50_evaluate_three_way.py" \
+    if conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/50_evaluate_three_way.py" \
         --baseline_dir "$BASE_SCORED_LIST" \
         --sft_dir "$SFT_SCORED_LIST" \
         --dpo_dir "$DPO_SCORED_LIST" \
@@ -1496,7 +1538,7 @@ if [ -x "$VESTA_BIN" ]; then
     VIZ_BACKEND="vesta"
 fi
 
-conda run -n myenv python "$SCRIPT_DIR/51_visualize_structures.py" \
+conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/51_visualize_structures.py" \
     --exp_dir "$EXP_DIR" \
     --targets "$TARGET_STR" \
     --branches "$BRANCH_STR" \
@@ -1561,10 +1603,10 @@ if timing_log.exists():
                 "duration_minutes": round(duration / 60, 1)
             }
 
-# Parse error entries
-error_entries = exp_dir / "logs" / "error_entries.jsonl"
-if error_entries.exists():
-    with open(error_entries) as f:
+# Parse error log
+error_log_file = exp_dir / "logs" / "errors.jsonl"
+if error_log_file.exists():
+    with open(error_log_file) as f:
         summary['errors'] = [json.loads(line) for line in f if line.strip()]
 
 # Check artifacts
