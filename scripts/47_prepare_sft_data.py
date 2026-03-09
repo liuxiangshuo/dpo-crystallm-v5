@@ -87,6 +87,8 @@ def main():
                     help="Ehull threshold for stable classification")
     ap.add_argument("--max_tokens", type=int, default=1024,
                     help="Maximum token length (sequences longer are dropped)")
+    ap.add_argument("--val_split", type=float, default=0.1,
+                    help="Fraction of data to hold out for validation (0 to disable)")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -202,18 +204,33 @@ def main():
             if skipped_error <= 5:
                 print(f"  WARNING: Error processing {fname}: {e}")
 
-    # ---- Step 4: Write JSONL ----
-    print(f"\nWriting {len(samples)} samples to {out_path}")
+    # ---- Step 4: Split train/val and write JSONL ----
+    import random as _random
+    split_rng = _random.Random(args.seed)
+    split_rng.shuffle(samples)
+
+    val_count = int(len(samples) * args.val_split) if args.val_split > 0 else 0
+    val_samples = samples[:val_count]
+    train_samples = samples[val_count:]
+
+    print(f"\nWriting {len(train_samples)} train samples to {out_path}")
     with open(out_path, "w", encoding="utf-8") as f:
-        for s in samples:
+        for s in train_samples:
             f.write(json.dumps(s, ensure_ascii=False) + "\n")
+
+    if val_samples:
+        val_path = out_path.parent / out_path.name.replace(".jsonl", "_val.jsonl")
+        print(f"Writing {len(val_samples)} val samples to {val_path}")
+        with open(val_path, "w", encoding="utf-8") as f:
+            for s in val_samples:
+                f.write(json.dumps(s, ensure_ascii=False) + "\n")
 
     # ---- Step 5: Report statistics ----
     print(f"\n{'='*60}")
     print(f"SFT Data Preparation Summary")
     print(f"{'='*60}")
     print(f"  Input stable CIFs: {stable_files_count}")
-    print(f"  Output samples: {len(samples)}")
+    print(f"  Output samples: {len(samples)} (train={len(train_samples)}, val={len(val_samples)})")
     print(f"  Skipped (missing): {skipped_missing}")
     print(f"  Skipped (too long > {args.max_tokens} tokens): {skipped_too_long}")
     print(f"  Skipped (error): {skipped_error}")
@@ -240,6 +257,9 @@ def main():
     stats = {
         "total_stable": stable_files_count,
         "output_samples": len(samples),
+        "train_samples": len(train_samples),
+        "val_samples": len(val_samples),
+        "val_split": args.val_split,
         "skipped_missing": skipped_missing,
         "skipped_too_long": skipped_too_long,
         "skipped_error": skipped_error,

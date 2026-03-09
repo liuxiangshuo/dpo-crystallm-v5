@@ -140,6 +140,13 @@ def main():
     ap.add_argument("--batch_size", type=int, default=16,
                     help="Batch size for training (default 16). "
                          "Use with --grad_accum_steps for larger effective batch size.")
+    ap.add_argument("--val_jsonl", default=None,
+                    help="Validation JSONL (from 47_prepare_sft_data.py). "
+                         "When provided, best_ckpt is selected by val loss instead of train loss.")
+    ap.add_argument("--val_every", type=int, default=0,
+                    help="Evaluate on val set every N optimizer steps (0 = every grad_accum checkpoint)")
+    ap.add_argument("--amp", action="store_true",
+                    help="Enable mixed-precision training (float16 autocast + GradScaler)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -208,6 +215,23 @@ def main():
         raise RuntimeError("No training samples loaded.")
     print(f"Loaded {len(data)} training samples.")
 
+    # --- Load validation data (optional) ---
+    val_data = []
+    if args.val_jsonl and os.path.isfile(args.val_jsonl):
+        with open(args.val_jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                token_ids = entry["token_ids"]
+                if len(token_ids) <= block_size:
+                    val_data.append(token_ids)
+        print(f"Loaded {len(val_data)} validation samples.")
+    elif args.val_jsonl:
+        print(f"WARNING: val_jsonl not found: {args.val_jsonl}, skipping validation.")
+    use_val = len(val_data) > 0
+
     # --- Training log ---
     log_file = out_dir / "training_log.jsonl"
     log_fh = open(log_file, "w", encoding="utf-8")
@@ -229,12 +253,49 @@ def main():
         "weight_decay": args.weight_decay,
         "seed": args.seed,
         "num_samples": len(data),
+        "num_val_samples": len(val_data),
+        "amp": args.amp,
         "trainable_params": total_trainable,
         "total_params": total_params,
         "block_size": block_size,
     }
     with open(out_dir / "hparams.json", "w", encoding="utf-8") as f:
         json.dump(hparams, f, indent=2)
+
+    # --- AMP setup ---
+    use_amp = args.amp and "cuda" in args.device
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    if use_amp:
+        print("AMP enabled: float16 autocast + GradScaler")
+
+    # --- Validation function ---
+    @torch.no_grad()
+    def evaluate_val():
+        model.eval()
+        total_loss = 0.0
+        total_tokens = 0
+        for i in range(0, len(val_data), args.batch_size):
+            batch_ids = val_data[i:i + args.batch_size]
+            lengths = [len(t) for t in batch_ids]
+            max_len = max(lengths)
+            padded = [t + [PAD_TOKEN_ID] * (max_len - len(t)) for t in batch_ids]
+            x = torch.tensor(padded, dtype=torch.long, device=args.device)
+            targets = torch.full_like(x, -1)
+            for j, length in enumerate(lengths):
+                if length > 1:
+                    targets[j, :length-1] = x[j, 1:length]
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                logits, _ = model(x, targets=targets)
+                logits_flat = logits.view(-1, logits.size(-1))
+                targets_flat = targets.view(-1)
+                valid_mask = targets_flat != -1
+                if valid_mask.sum() > 0:
+                    loss = F.cross_entropy(logits_flat[valid_mask], targets_flat[valid_mask])
+                    n_valid = valid_mask.sum().item()
+                    total_loss += loss.item() * n_valid
+                    total_tokens += n_valid
+        model.train()
+        return total_loss / max(total_tokens, 1)
 
     # --- Training loop ---
     rng = random.Random(args.seed)
@@ -283,44 +344,47 @@ def main():
     accum_loss = 0.0
     avg_loss = 0.0
     accum_count = 0
+    accum_tokens = 0
+    accum_token_seqs = 0
     best_loss = float("inf")
     best_step = 0
+    val_every = args.val_every if args.val_every > 0 else args.grad_accum_steps
+    optimizer_steps = 0
 
     print(f"\nStarting SFT training: {args.steps} steps, {len(data)} samples, "
           f"~{args.steps * args.batch_size / len(data):.1f} epochs")
     print(f"Batch size: {args.batch_size} | Grad accum: {args.grad_accum_steps} | "
           f"Effective batch size: {args.batch_size * args.grad_accum_steps}")
     print(f"LR: {args.lr}, Warmup: {args.warmup_steps}")
+    if use_val:
+        print(f"Validation: {len(val_data)} samples, eval every {val_every} optimizer steps")
+        print(f"  Best checkpoint selected by: val_loss")
+    else:
+        print(f"  Best checkpoint selected by: train_loss")
     print()
 
     for step in range(1, args.steps + 1):
         # --- Get next batch (with epoch cycling) ---
         x, batch_lengths = get_batch(args.batch_size)
-        batch_max_len = x.shape[1]
 
-        # --- Forward pass: standard cross-entropy ---
-        # nanoGPT convention: targets must be pre-shifted (targets[i] = next token after idx[i])
-        # The model computes: F.cross_entropy(logits, targets, ignore_index=-1)
         # Create targets by shifting left and masking padded positions
-        targets = torch.full_like(x, -1)  # -1 is ignore_index
+        targets = torch.full_like(x, -1)
         for i, length in enumerate(batch_lengths):
             if length > 1:
                 targets[i, :length-1] = x[i, 1:length]
 
-        # Forward pass
-        logits, _ = model(x, targets=targets)
+        # Forward pass with optional AMP
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            logits, _ = model(x, targets=targets)
+            logits_flat = logits.view(-1, logits.size(-1))
+            targets_flat = targets.view(-1)
+            loss = F.cross_entropy(logits_flat, targets_flat, ignore_index=-1)
 
-        # Compute loss manually to properly handle masking
-        # Flatten for cross_entropy
-        logits_flat = logits.view(-1, logits.size(-1))
-        targets_flat = targets.view(-1)
-
-        # Compute loss (ignore_index=-1 handles padding)
-        loss = F.cross_entropy(logits_flat, targets_flat, ignore_index=-1)
-
-        (loss / args.grad_accum_steps).backward()
+        scaler.scale(loss / args.grad_accum_steps).backward()
         accum_loss += loss.item()
         accum_count += 1
+        accum_tokens += sum(batch_lengths)
+        accum_token_seqs += len(batch_lengths)
 
         # --- Optimizer step (every grad_accum_steps) ---
         if step % args.grad_accum_steps == 0 or step == args.steps:
@@ -329,16 +393,19 @@ def main():
             for pg in opt.param_groups:
                 pg["lr"] = current_lr
 
-            # Gradient clipping
+            # Gradient clipping (unscale first for AMP)
+            scaler.unscale_(opt)
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm).item()
 
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
             opt.zero_grad()
+            optimizer_steps += 1
 
             # Log
             avg_loss = accum_loss / accum_count if accum_count else 0
             elapsed = time.perf_counter() - t0
-            avg_tokens = sum(batch_lengths) / len(batch_lengths)
+            avg_tokens = accum_tokens / accum_token_seqs if accum_token_seqs else 0
 
             log_entry = {
                 "step": step,
@@ -350,25 +417,36 @@ def main():
                 "n_tokens": avg_tokens,
                 "batch_size": args.batch_size,
             }
+
+            # Validation evaluation
+            if use_val and (optimizer_steps % val_every == 0 or step == args.steps):
+                val_loss = evaluate_val()
+                log_entry["val_loss"] = round(val_loss, 6)
+
             log_fh.write(json.dumps(log_entry) + "\n")
             log_fh.flush()
 
             if step % max(1, args.grad_accum_steps * 10) == 0 or step == args.steps:
-                print(
-                    f"step={step}/{args.steps} loss={avg_loss:.5f} "
-                    f"lr={current_lr:.2e} gnorm={grad_norm:.3f} epoch={epoch} "
-                    f"avg_tok={avg_tokens:.0f} [{elapsed:.0f}s]"
-                )
+                msg = (f"step={step}/{args.steps} loss={avg_loss:.5f} "
+                       f"lr={current_lr:.2e} gnorm={grad_norm:.3f} epoch={epoch} "
+                       f"avg_tok={avg_tokens:.0f}")
+                if "val_loss" in log_entry:
+                    msg += f" val={log_entry['val_loss']:.5f}"
+                msg += f" [{elapsed:.0f}s]"
+                print(msg)
 
-            # Track best checkpoint by loss
-            if avg_loss < best_loss:
-                best_loss = avg_loss
+            # Track best checkpoint: prefer val_loss when available
+            selection_loss = log_entry.get("val_loss", avg_loss)
+            if selection_loss < best_loss:
+                best_loss = selection_loss
                 best_step = step
                 sd_best = merge_lora_state_dict(model) if args.strategy == "lora" else model.state_dict()
                 torch.save({"model_args": ckpt["model_args"], "model": sd_best}, out_dir / "best_ckpt.pt")
 
             accum_loss = 0.0
             accum_count = 0
+            accum_tokens = 0
+            accum_token_seqs = 0
 
         # --- Periodic checkpoint ---
         if args.save_every > 0 and step % args.save_every == 0 and step < args.steps:
@@ -387,16 +465,20 @@ def main():
     log_fh.close()
 
     total_time = time.perf_counter() - t0
+    best_metric = "val_loss" if use_val else "train_loss"
     print(f"\nSFT training complete in {total_time:.1f}s ({total_time/3600:.1f}h)")
     print(f"  Final checkpoint: {final_ckpt}")
     if best_step > 0:
-        print(f"  Best checkpoint:  {out_dir / 'best_ckpt.pt'} (step {best_step}, loss {best_loss:.5f})")
+        print(f"  Best checkpoint:  {out_dir / 'best_ckpt.pt'} (step {best_step}, {best_metric}={best_loss:.5f})")
     else:
         print(f"  Best checkpoint:  not saved (no valid loss recorded)")
     print(f"  Training log: {log_file}")
     print(f"  Hyperparams: {out_dir / 'hparams.json'}")
     print(f"  Epochs completed: {epoch}")
-    print(f"  Final loss: {avg_loss:.5f}")
+    print(f"  Final train loss: {avg_loss:.5f}")
+    if use_val:
+        final_val = evaluate_val()
+        print(f"  Final val loss: {final_val:.5f}")
 
 
 if __name__ == "__main__":

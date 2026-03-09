@@ -44,28 +44,7 @@ cd "$PROJECT_ROOT"
 : "${CRYSTALLM_CKPT_DIR:?'CRYSTALLM_CKPT_DIR must be set'}"
 : "${CRYSTALLM_PKG_DIR:?'CRYSTALLM_PKG_DIR must be set'}"
 
-# #region agent log
-python3 - <<'PY'
-import json
-import os
-import time
-
-entry = {
-    "sessionId": "25e703",
-    "runId": "pre-fix-1",
-    "hypothesisId": "H5",
-    "location": "scripts/run_sft_rl_pipeline.sh:early_startup",
-    "message": "pipeline script entered after required vars",
-    "data": {
-        "exp_name": os.environ.get("EXP_NAME", ""),
-        "targets": os.environ.get("TARGETS", ""),
-    },
-    "timestamp": int(time.time() * 1000),
-}
-with open("/home/liuxiangshuo/projects/dpo-crystallm/.cursor/debug-25e703.log", "a", encoding="utf-8") as f:
-    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-PY
-# #endregion
+DEBUG_LOG=${DEBUG_LOG:-0}
 
 # ---- Defaults ----
 NUM_SAMPLES=${NUM_SAMPLES:-10000}
@@ -120,6 +99,7 @@ SFT_STRATEGY=${SFT_STRATEGY:-lora}
 SFT_LORA_RANK=${SFT_LORA_RANK:-16}
 SFT_WEIGHT_DECAY=${SFT_WEIGHT_DECAY:-0.01}
 EHULL_THRESHOLD=${EHULL_THRESHOLD:-0.05}
+MIN_SFT_SAMPLES=${MIN_SFT_SAMPLES:-100}
 
 # DPO (Stage 2)
 DPO_STEPS=${DPO_STEPS:-4000}
@@ -137,6 +117,7 @@ DPO_SIMPO_GAMMA=${DPO_SIMPO_GAMMA:-1.0}
 DPO_REWARD_WEIGHTED=${DPO_REWARD_WEIGHTED:-1}
 DPO_REWARD_ALPHA=${DPO_REWARD_ALPHA:-1.0}
 DPO_WEIGHT_DECAY=${DPO_WEIGHT_DECAY:-0.01}
+DPO_BATCH_SIZE=${DPO_BATCH_SIZE:-4}
 
 # Sampling diversity
 TEMPERATURE_RANGE=${TEMPERATURE_RANGE:-}
@@ -235,8 +216,8 @@ PYEOF
 # Main log redirection
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-# #region agent log (using shared pipeline_utils.py)
 debug_log() {
+    [ "$DEBUG_LOG" != "1" ] && return 0
     local run_id="$1"
     local hypothesis_id="$2"
     local location="$3"
@@ -250,7 +231,6 @@ debug_log() {
         --message "$message" \
         --data "$data_json"
 }
-# #endregion
 
 echo "=========================================="
 echo "SFT + RL Two-Stage Pipeline"
@@ -283,6 +263,10 @@ echo "  PAIR_BOTTOM_PERCENT:   $PAIR_BOTTOM_PERCENT"
 echo "  PAIR_MIN_PER_PROMPT:   $PAIR_MIN_PER_PROMPT"
 echo "  PAIR_MAX_PER_PROMPT:    $PAIR_MAX_PER_PROMPT"
 echo "  MIN_PAIRS:             $MIN_PAIRS (min pairs per target required)"
+echo ""
+echo "--- SFT Parameters ---"
+echo "  EHULL_THRESHOLD:       $EHULL_THRESHOLD"
+echo "  MIN_SFT_SAMPLES:      $MIN_SFT_SAMPLES"
 echo ""
 echo "--- DPO Training Parameters ---"
 echo "  DPO_TOTAL_PAIRS:       $DPO_TOTAL_PAIRS (total pairs required for merge)"
@@ -328,6 +312,8 @@ cleanup_phase() {
             for b in "${BRANCH_LIST[@]}"; do
                 for t in "${TARGET_LIST[@]}"; do rm -rf "$EXP_DIR/$t/sft_$b"; done
             done
+            rm -f "$EXP_DIR/reward_buffers/reward_proxy_buffer.json"
+            rm -f "$EXP_DIR/reward_buffers/reward_novelty_buffer.json"
             ;;
         4)
             for b in "${BRANCH_LIST[@]}"; do rm -rf "$EXP_DIR/dpo_$b"; done
@@ -457,10 +443,14 @@ is_phase4_done() {
             return 1
         fi
         
-        # Check merged pairs count matches DPO_TOTAL_PAIRS
+        # Check merged pairs count (train file has ~90% of DPO_TOTAL_PAIRS due to val split)
         local count=$(wc -l < "$merged_file")
-        if [ "$count" -ne "$DPO_TOTAL_PAIRS" ]; then
-            echo "[validate] Phase 4: $branch merged pairs $count != required $DPO_TOTAL_PAIRS"
+        local val_file="$dpo_dir/val_pairs.jsonl"
+        local val_count=0
+        [ -f "$val_file" ] && val_count=$(wc -l < "$val_file")
+        local total_count=$((count + val_count))
+        if [ "$total_count" -ne "$DPO_TOTAL_PAIRS" ]; then
+            echo "[validate] Phase 4: $branch total pairs $total_count (train=$count + val=$val_count) != required $DPO_TOTAL_PAIRS"
             return 1
         fi
         
@@ -660,9 +650,7 @@ else:
 build_prompt() {
     local target="$1"
     local z="${PROMPT_Z_MAP_DICT[$target]:-1}"
-    # #region agent log
     debug_log "pre-fix-1" "H4" "run_sft_rl_pipeline.sh:BUILD_PROMPT" "Resolved prompt Z value for target" "{\"target\":\"$target\",\"z_raw\":\"$z\"}"
-    # #endregion
     python3 -c "
 import re
 formula, z = '$target', int('$z')
@@ -856,6 +844,7 @@ if [ "${#MISSING_EHULL_INPUTS[@]}" -gt 0 ]; then
 fi
 
 SFT_JSONL="$SFT_DATA_DIR/sft_data.jsonl"
+SFT_VAL_JSONL="$SFT_DATA_DIR/sft_data_val.jsonl"
 if [ ! -f "$SFT_JSONL" ] || [ ! -s "$SFT_JSONL" ]; then
     echo "Preparing multi-composition SFT data ..."
     conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/47_prepare_sft_data.py" \
@@ -864,14 +853,16 @@ if [ ! -f "$SFT_JSONL" ] || [ ! -s "$SFT_JSONL" ]; then
         --pkg_dir "$CRYSTALLM_PKG_DIR" \
         --out_jsonl "$SFT_JSONL" \
         --ehull_threshold "$EHULL_THRESHOLD" \
-        --max_tokens "$MAX_TOKENS"
+        --max_tokens "$MAX_TOKENS" \
+        --val_split 0.1
 fi
 
 SFT_DATA_COUNT=$(wc -l < "$SFT_JSONL" 2>/dev/null || echo 0)
-echo "SFT training data: $SFT_DATA_COUNT samples"
+echo "SFT training data: $SFT_DATA_COUNT samples (gate: $MIN_SFT_SAMPLES)"
 
-if [ "$SFT_DATA_COUNT" -lt 10 ]; then
-    echo "ERROR: Too few SFT samples ($SFT_DATA_COUNT). Aborting."
+if [ "$SFT_DATA_COUNT" -lt "$MIN_SFT_SAMPLES" ]; then
+    echo "ERROR: Too few SFT samples ($SFT_DATA_COUNT < $MIN_SFT_SAMPLES). Aborting."
+    echo "       Consider lowering EHULL_THRESHOLD (currently $EHULL_THRESHOLD) or increasing NUM_SAMPLES."
     exit 1
 fi
 
@@ -902,6 +893,9 @@ for branch in "${BRANCH_LIST[@]}"; do
         [ -n "$B_LORA_TARGETS" ] && LORA_ARGS="$LORA_ARGS --lora_target_names $B_LORA_TARGETS"
     fi
 
+    VAL_ARGS=""
+    [ -f "$SFT_VAL_JSONL" ] && VAL_ARGS="--val_jsonl $SFT_VAL_JSONL"
+
     if ! conda run -n "$CONDA_ENV_DPO" python "$SCRIPT_DIR/33_train_sft_crystallm.py" \
         --data_jsonl "$SFT_JSONL" \
         --ckpt_dir "$CRYSTALLM_CKPT_DIR" \
@@ -915,8 +909,10 @@ for branch in "${BRANCH_LIST[@]}"; do
         --warmup_steps "$B_WARMUP" \
         --weight_decay "$B_WEIGHT_DECAY" \
         --strategy "$B_STRATEGY" \
+        --amp \
         --device cuda \
         --seed "$SEED" \
+        $VAL_ARGS \
         $LORA_ARGS; then
         log_error "2" "run_sft_rl_pipeline.sh:SFT_TRAIN" "SFT training failed for branch" "{\"branch\":\"$branch\",\"strategy\":\"$B_STRATEGY\",\"steps\":$B_STEPS}"
         echo "ERROR: SFT training failed for branch=$branch"
@@ -940,6 +936,13 @@ echo "Phase 3: SFT Model Resample + Scoring"
 echo "=========================================="
 
 PHASE3_SUCCESS_BRANCHES=0
+
+# Clear reward rolling buffers so Phase 3 scoring uses an independent distribution
+# (avoids Phase 1 history diluting SFT improvement signal)
+rm -f "$EXP_DIR/reward_buffers/reward_proxy_buffer.json"
+rm -f "$EXP_DIR/reward_buffers/reward_novelty_buffer.json"
+echo "[Phase 3] Cleared reward rolling buffers for independent scoring"
+
 for branch in "${BRANCH_LIST[@]}"; do
     branch=$(echo "$branch" | xargs)
     BRANCH_QUALIFIED_TARGETS=0
@@ -1076,9 +1079,7 @@ for branch in "${BRANCH_LIST[@]}"; do
             --prompt_cif "$(build_prompt "$target")"; then
             N_PAIRS=$(wc -l < "$PAIRS_DIR/pairs.jsonl" 2>/dev/null || echo 0)
             echo "  Pairs: $N_PAIRS (gate: $MIN_PAIRS)"
-            # #region agent log
             debug_log "pre-fix-1" "H2" "run_sft_rl_pipeline.sh:PHASE3_PAIRS" "Pair construction result per target" "{\"branch\":\"$branch\",\"target\":\"$target\",\"pairs\":$N_PAIRS,\"min_pairs\":$MIN_PAIRS,\"pair_max_per_prompt\":$PAIR_MAX_PER_PROMPT,\"pair_strategy\":\"$PAIR_STRATEGY\",\"pair_top_percent\":$PAIR_TOP_PERCENT,\"pair_bottom_percent\":$PAIR_BOTTOM_PERCENT}"
-            # #endregion
             # FAIL-FAST: Abort if pairs are insufficient
             if [ "$N_PAIRS" -lt "$MIN_PAIRS" ]; then
                 echo "ERROR: Too few pairs for $target [$branch] ($N_PAIRS < $MIN_PAIRS). Aborting pipeline."
@@ -1135,9 +1136,7 @@ for branch in "${BRANCH_LIST[@]}"; do
         target=$(echo "$target" | xargs)
         PAIR_FILE="$EXP_DIR/$target/sft_$branch/pairs/pairs.jsonl"
         PAIR_COUNT=$(wc -l < "$PAIR_FILE" 2>/dev/null || echo 0)
-        # #region agent log
         debug_log "pre-fix-1" "H1" "run_sft_rl_pipeline.sh:PHASE4_TARGET_FILTER" "Phase4 pair count before MIN_PAIRS filter" "{\"branch\":\"$branch\",\"target\":\"$target\",\"pair_count\":$PAIR_COUNT,\"min_pairs\":$MIN_PAIRS,\"dpo_total_pairs\":$DPO_TOTAL_PAIRS}"
-        # #endregion
         if [ "$PAIR_COUNT" -ge "$MIN_PAIRS" ]; then
             ACTIVE_TARGETS+=("$target")
             echo "  $target [$branch]: pairs=$PAIR_COUNT (>= $MIN_PAIRS)"
@@ -1194,9 +1193,7 @@ for branch in "${BRANCH_LIST[@]}"; do
 
     # Dynamic per-target allocation to exact DPO_TOTAL_PAIRS (no cross-target pairing).
     TARGETS_CSV=$(IFS=','; echo "${ACTIVE_TARGETS[*]}")
-    # #region agent log
     debug_log "pre-fix-1" "H1" "run_sft_rl_pipeline.sh:PHASE4_ACTIVE_TARGETS" "Active targets selected for DPO merge" "{\"branch\":\"$branch\",\"active_targets\":\"$TARGETS_CSV\",\"active_count\":${#ACTIVE_TARGETS[@]},\"total_targets\":${#TARGET_LIST[@]},\"dpo_total_pairs\":$DPO_TOTAL_PAIRS}"
-    # #endregion
     # Use shared pair_merge.py module for pair merging
     if ! conda run -n "$CONDA_ENV_MYENV" python "$SCRIPT_DIR/shared/pair_merge.py" \
             --exp_dir "$EXP_DIR" \
@@ -1214,12 +1211,14 @@ for branch in "${BRANCH_LIST[@]}"; do
     # NOTE: Pair merge is performed by pair_merge.py module above.
     # (Reference implementation removed to avoid bash syntax issues with embedded Python.)
 
-    MERGED_PAIRS=$(wc -l < "$DPO_DIR/merged_pairs.jsonl" 2>/dev/null || echo 0)
-    echo "Total merged pairs [$branch]: $MERGED_PAIRS"
+    MERGED_TRAIN=$(wc -l < "$DPO_DIR/merged_pairs.jsonl" 2>/dev/null || echo 0)
+    MERGED_VAL=$(wc -l < "$DPO_DIR/val_pairs.jsonl" 2>/dev/null || echo 0)
+    MERGED_TOTAL=$((MERGED_TRAIN + MERGED_VAL))
+    echo "Total merged pairs [$branch]: $MERGED_TOTAL (train=$MERGED_TRAIN, val=$MERGED_VAL)"
 
-    # FAIL-FAST: Abort if merged pairs don't match exactly
-    if [ "$MERGED_PAIRS" -ne "$DPO_TOTAL_PAIRS" ]; then
-        echo "ERROR: Merged pairs mismatch for $branch ($MERGED_PAIRS != $DPO_TOTAL_PAIRS). Aborting pipeline."
+    # FAIL-FAST: Abort if total merged pairs (train + val) don't match exactly
+    if [ "$MERGED_TOTAL" -ne "$DPO_TOTAL_PAIRS" ]; then
+        echo "ERROR: Merged pairs mismatch for $branch ($MERGED_TOTAL != $DPO_TOTAL_PAIRS). Aborting pipeline."
         echo "       Check Phase 3 pair generation or adjust DPO_TOTAL_PAIRS."
         exit 1
     fi
@@ -1246,6 +1245,10 @@ for branch in "${BRANCH_LIST[@]}"; do
         REWARD_ARGS="--reward_weighted --reward_alpha $DPO_REWARD_ALPHA"
     fi
 
+    DPO_VAL_PAIRS="$DPO_DIR/val_pairs.jsonl"
+    DPO_VAL_ARGS=""
+    [ -f "$DPO_VAL_PAIRS" ] && DPO_VAL_ARGS="--val_pairs $DPO_VAL_PAIRS"
+
     echo "Training DPO[$branch] on SFT checkpoint ..."
     conda run -n "$CONDA_ENV_DPO" python "$SCRIPT_DIR/32_train_dpo_crystallm.py" \
         --pairs "$DPO_DIR/merged_pairs.jsonl" \
@@ -1265,9 +1268,12 @@ for branch in "${BRANCH_LIST[@]}"; do
         --label_smoothing "$DPO_LABEL_SMOOTHING" \
         --simpo_gamma "$DPO_SIMPO_GAMMA" \
         --weight_decay "$DPO_WEIGHT_DECAY" \
+        --batch_size "$DPO_BATCH_SIZE" \
+        --amp \
         --device cuda \
         --seed "$SEED" \
-        $REWARD_ARGS
+        $REWARD_ARGS \
+        $DPO_VAL_ARGS
 
     echo "DPO[$branch] training complete. Checkpoint: $DPO_CKPT_DIR/ckpt.pt"
     if [ -f "$DPO_CKPT_DIR/ckpt.pt" ] || [ -f "$DPO_CKPT_DIR/best_ckpt.pt" ]; then
