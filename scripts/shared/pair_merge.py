@@ -153,6 +153,7 @@ def merge_pairs(
     target_total: int,
     seed: int,
     out_path: str,
+    val_split: float = 0.1,
     log_path: Optional[str] = None,
     run_id: str = "pre-fix-1",
     session_id: str = "25e703"
@@ -168,6 +169,7 @@ def merge_pairs(
         target_total: Required total number of pairs
         seed: Random seed
         out_path: Output path for merged pairs JSONL
+        val_split: Fraction of merged pairs to hold out for validation (0 to disable)
         log_path: Optional path for agent log
         run_id: Run identifier for logging
         session_id: Session identifier for logging
@@ -248,18 +250,34 @@ def merge_pairs(
     # Final shuffle across all targets
     rng.shuffle(merged)
 
-    # Write output
+    # Split train/val before writing
+    val_count = int(len(merged) * val_split) if val_split > 0 else 0
+    val_pairs = merged[:val_count]
+    train_pairs = merged[val_count:]
+
+    # Write training output
     out_file.parent.mkdir(parents=True, exist_ok=True)
     with open(out_file, "w", encoding="utf-8") as f:
-        for rec in merged:
+        for rec in train_pairs:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    # Write validation output
+    val_file = out_file.parent / "val_pairs.jsonl"
+    if val_pairs:
+        with open(val_file, "w", encoding="utf-8") as f:
+            for rec in val_pairs:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        print(f"Validation pairs: {len(val_pairs)} -> {val_file}")
 
     # Write summary
     summary = {
         "requested_total_pairs": target_total,
         "available_pairs_by_target": counts,
         "allocated_pairs_by_target": alloc,
-        "merged_pairs": len(merged)
+        "merged_pairs": len(merged),
+        "train_pairs": len(train_pairs),
+        "val_pairs": len(val_pairs),
+        "val_split": val_split,
     }
 
     summary_path = out_file.parent / "merge_pairs_summary.json"
@@ -267,7 +285,7 @@ def merge_pairs(
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
     print(f"Allocated pairs by target: {alloc}")
-    print(f"Wrote merged pairs: {len(merged)} -> {out_file}")
+    print(f"Wrote merged pairs: {len(train_pairs)} train + {len(val_pairs)} val -> {out_file}")
 
     return summary
 
@@ -283,6 +301,8 @@ def main():
     ap.add_argument("--target_total", type=int, required=True, help="Total pairs required")
     ap.add_argument("--seed", type=int, default=42, help="Random seed")
     ap.add_argument("--out", required=True, help="Output path for merged pairs")
+    ap.add_argument("--val_split", type=float, default=0.1,
+                    help="Fraction of pairs to hold out for DPO validation (0 to disable)")
     ap.add_argument("--log_path", default=None, help="Path for agent log")
     ap.add_argument("--run_id", default="pre-fix-1", help="Run ID for logging")
 
@@ -295,6 +315,7 @@ def main():
         target_total=args.target_total,
         seed=args.seed,
         out_path=args.out,
+        val_split=args.val_split,
         log_path=args.log_path,
         run_id=args.run_id
     )

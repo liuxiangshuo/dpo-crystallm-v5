@@ -161,13 +161,12 @@ def check_score_fail_rate(
         print(f"  Score fail-rate [{label}]: {failed}/{total} ({rate:.2%}), mode={mode}, threshold={threshold:.2%}")
 
     passed = True
-    if mode == "fail" and rate > threshold:
-        print(f"ERROR [{label}]: Score fail-rate {rate:.2%} exceeds threshold {threshold:.2%}")
-        sys.exit(2)
-    elif mode in ("warn", "fail") and rate > threshold:
-        print(f"  WARNING [{label}]: Score fail-rate {rate:.2%} exceeds threshold {threshold:.2%}")
+    if rate > threshold:
         if mode == "fail":
+            print(f"ERROR [{label}]: Score fail-rate {rate:.2%} exceeds threshold {threshold:.2%}")
             passed = False
+        elif mode == "warn":
+            print(f"  WARNING [{label}]: Score fail-rate {rate:.2%} exceeds threshold {threshold:.2%}")
 
     return passed, rate, failed, total
 

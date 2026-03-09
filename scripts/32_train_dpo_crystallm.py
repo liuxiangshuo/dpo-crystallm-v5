@@ -133,21 +133,10 @@ def get_full_logits(model, x: torch.Tensor):
     return out
 
 
-def logp_sequence(model, token_ids, prompt_len: int, device: str):
-    """Sum of log-probs over completion tokens (for DPO / cDPO)."""
-    x = torch.tensor(token_ids, dtype=torch.long, device=device).unsqueeze(0)
-    logits = get_full_logits(model, x)
-    logprobs = F.log_softmax(logits, dim=-1)
-    tgt = x[:, 1:]
-    lp = logprobs[:, :-1, :].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
-    start = max(0, prompt_len - 1)
-    return lp[:, start:].sum()
-
-
 def logp_sequence_avg(model, token_ids, prompt_len: int, device: str):
-    """Average log-prob per completion token (for SimPO).
+    """Average log-prob per completion token.
 
-    SimPO uses length-normalized average log-prob as the implicit reward,
+    Uses length-normalized average log-prob as the implicit reward,
     preventing bias toward shorter/longer sequences.
     """
     x = torch.tensor(token_ids, dtype=torch.long, device=device).unsqueeze(0)
@@ -159,6 +148,33 @@ def logp_sequence_avg(model, token_ids, prompt_len: int, device: str):
     completion_lp = lp[:, start:]
     n_tokens = max(completion_lp.shape[1], 1)
     return completion_lp.sum() / n_tokens
+
+
+def logp_batch_avg(model, batch_ids_list, prompt_lens, device, pad_id=0):
+    """Batched average log-prob per completion token.
+
+    Pads sequences, runs a single forward pass, and returns per-sequence
+    average log-prob over completion tokens (after prompt_len).
+    """
+    B = len(batch_ids_list)
+    lengths = [len(ids) for ids in batch_ids_list]
+    max_len = max(lengths)
+    padded = [ids + [pad_id] * (max_len - len(ids)) for ids in batch_ids_list]
+    x = torch.tensor(padded, dtype=torch.long, device=device)
+
+    logits = get_full_logits(model, x)                       # [B, T, V]
+    logprobs = F.log_softmax(logits, dim=-1)                  # [B, T, V]
+    tgt = x[:, 1:]                                            # [B, T-1]
+    lp = logprobs[:, :-1, :].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)  # [B, T-1]
+
+    results = []
+    for i in range(B):
+        start = max(0, prompt_lens[i] - 1)
+        end = lengths[i] - 1
+        completion_lp = lp[i, start:end]
+        n_tokens = max(completion_lp.shape[0], 1)
+        results.append(completion_lp.sum() / n_tokens)
+    return torch.stack(results)
 
 
 def encode_text(tokenizer, text: str):
@@ -209,6 +225,15 @@ def main():
                     help="Scaling factor for reward margin in reward-weighted DPO")
     ap.add_argument("--weight_decay", type=float, default=0.01,
                     help="AdamW weight decay (default 0.01)")
+    ap.add_argument("--batch_size", type=int, default=1,
+                    help="Number of pairs per training step (>1 uses batched forward)")
+    ap.add_argument("--val_pairs", default=None,
+                    help="Validation JSONL pairs for held-out evaluation. "
+                         "When provided, best_ckpt is selected by val_loss instead of train_loss.")
+    ap.add_argument("--val_every", type=int, default=0,
+                    help="Evaluate on val set every N optimizer steps (0 = every grad_accum checkpoint)")
+    ap.add_argument("--amp", action="store_true",
+                    help="Enable mixed-precision training (float16 autocast + GradScaler)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=123)
     args = ap.parse_args()
@@ -263,6 +288,15 @@ def main():
         raise RuntimeError("No pairs loaded.")
     print(f"Loaded {len(pairs)} preference pairs.")
 
+    # --- Load validation pairs (optional) ---
+    val_pairs = []
+    if args.val_pairs and os.path.isfile(args.val_pairs):
+        val_pairs = [json.loads(x) for x in Path(args.val_pairs).read_text(encoding="utf-8").splitlines() if x.strip()]
+        print(f"Loaded {len(val_pairs)} validation pairs.")
+    elif args.val_pairs:
+        print(f"WARNING: val_pairs not found: {args.val_pairs}, skipping validation.")
+    use_val = len(val_pairs) > 0
+
     # --- Training log ---
     log_file = out_dir / "training_log.jsonl"
     log_fh = open(log_file, "w", encoding="utf-8")
@@ -272,10 +306,27 @@ def main():
           (f" (label_smoothing={args.label_smoothing})" if args.loss_type == "cdpo" else "") +
           (f" (gamma={args.simpo_gamma})" if args.loss_type == "simpo" else ""))
 
+    # --- Reward margin normalization ---
+    # Pre-compute std of reward margins so that reward_margin and beta*adv
+    # operate on comparable numerical scales.
+    reward_margin_std = 1.0
+    if args.reward_weighted:
+        raw_margins = []
+        for p in pairs:
+            rc = float(p.get("chosen_reward", 0.0) or 0.0)
+            rr = float(p.get("rejected_reward", 0.0) or 0.0)
+            raw_margins.append(rc - rr)
+        if len(raw_margins) > 1:
+            import statistics as _stat
+            reward_margin_std = max(_stat.stdev(raw_margins), 1e-8)
+        print(f"Reward margin normalization: std={reward_margin_std:.4f} "
+              f"(raw margins will be divided by std before scaling by alpha)")
+
     hparams = {
         "beta": args.beta,
         "lr": args.lr,
         "steps": args.steps,
+        "batch_size": args.batch_size,
         "grad_accum_steps": args.grad_accum_steps,
         "max_grad_norm": args.max_grad_norm,
         "weight_decay": args.weight_decay,
@@ -285,23 +336,73 @@ def main():
         "simpo_gamma": args.simpo_gamma if args.loss_type == "simpo" else None,
         "reward_weighted": args.reward_weighted,
         "reward_alpha": args.reward_alpha if args.reward_weighted else None,
+        "reward_margin_std": reward_margin_std if args.reward_weighted else None,
+        "amp": args.amp,
         "lora_rank": args.lora_rank if args.strategy == "lora" else None,
         "lora_alpha": args.lora_alpha if args.strategy == "lora" else None,
         "warmup_steps": args.warmup_steps,
         "seed": args.seed,
         "num_pairs": len(pairs),
+        "num_val_pairs": len(val_pairs),
         "trainable_params": total_trainable,
         "total_params": total_params,
     }
     with open(out_dir / "hparams.json", "w", encoding="utf-8") as f:
         json.dump(hparams, f, indent=2)
 
+    # --- AMP setup ---
+    use_amp = args.amp and "cuda" in args.device
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    if use_amp:
+        print("AMP enabled: float16 autocast + GradScaler")
+
+    # --- Pad token for batching ---
+    vocab_size = getattr(tokenizer, "vocab_size", None) or 128
+    PAD_ID = vocab_size - 1
+
+    # --- Validation function ---
+    @torch.no_grad()
+    def evaluate_val():
+        policy.eval()
+        total_loss = 0.0
+        n_val = 0
+        for vp in val_pairs:
+            v_prompt_ids = encode_text(tokenizer, vp["prompt"] + "\n")
+            v_chosen_ids = encode_text(tokenizer, vp["prompt"] + "\n" + vp["chosen"])
+            v_rejected_ids = encode_text(tokenizer, vp["prompt"] + "\n" + vp["rejected"])
+            v_prompt_len = len(v_prompt_ids)
+
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                v_lp_c = logp_sequence_avg(policy, v_chosen_ids, v_prompt_len, args.device)
+                v_lp_r = logp_sequence_avg(policy, v_rejected_ids, v_prompt_len, args.device)
+
+                if args.loss_type == "simpo":
+                    v_adv = v_lp_c - v_lp_r
+                    v_loss = -F.logsigmoid(args.beta * v_adv - args.simpo_gamma)
+                else:
+                    v_lpr_c = logp_sequence_avg(ref, v_chosen_ids, v_prompt_len, args.device)
+                    v_lpr_r = logp_sequence_avg(ref, v_rejected_ids, v_prompt_len, args.device)
+                    v_adv = (v_lp_c - v_lp_r) - (v_lpr_c - v_lpr_r)
+
+                    if args.loss_type == "cdpo":
+                        eps = args.label_smoothing
+                        v_loss = (-(1 - eps) * F.logsigmoid(args.beta * v_adv)
+                                  - eps * F.logsigmoid(-args.beta * v_adv))
+                    else:
+                        v_loss = -F.logsigmoid(args.beta * v_adv)
+
+            total_loss += v_loss.item()
+            n_val += 1
+
+        policy.train()
+        return total_loss / max(n_val, 1)
+
     # --- Training loop ---
     import random
     rng = random.Random(args.seed)
     t0 = time.perf_counter()
+    batch_size = max(1, args.batch_size)
 
-    # Build epoch-shuffled index
     def make_shuffled_indices():
         idx = list(range(len(pairs)))
         rng.shuffle(idx)
@@ -311,130 +412,155 @@ def main():
     data_ptr = 0
     epoch = 0
 
-    opt.zero_grad()
-    accum_loss = 0.0
-    accum_adv = 0.0
-    accum_count = 0
-    best_loss = float("inf")
-    best_step = 0
-
-    for step in range(1, args.steps + 1):
-        # --- Get next pair (with epoch cycling) ---
+    def next_pair():
+        nonlocal data_ptr, epoch, data_idx
         if data_ptr >= len(data_idx):
             epoch += 1
             data_idx = make_shuffled_indices()
             data_ptr = 0
         ex = pairs[data_idx[data_ptr]]
         data_ptr += 1
+        return ex
 
-        prompt = ex["prompt"]
-        chosen = ex["chosen"]
-        rejected = ex["rejected"]
+    opt.zero_grad()
+    accum_loss = 0.0
+    accum_adv = 0.0
+    accum_acc = 0.0
+    accum_count = 0
+    best_loss = float("inf")
+    best_step = 0
+    val_every = args.val_every if args.val_every > 0 else args.grad_accum_steps
+    optimizer_steps = 0
 
-        prompt_ids = encode_text(tokenizer, prompt + "\n")
-        chosen_ids = encode_text(tokenizer, prompt + "\n" + chosen)
-        rejected_ids = encode_text(tokenizer, prompt + "\n" + rejected)
+    print(f"\nStarting DPO training: {args.steps} steps, {len(pairs)} pairs, "
+          f"batch_size={batch_size}")
+    if use_val:
+        print(f"Validation: {len(val_pairs)} pairs, eval every {val_every} optimizer steps")
+        print(f"  Best checkpoint selected by: val_loss")
+    else:
+        print(f"  Best checkpoint selected by: train_loss")
 
-        # ---- Reward margin (optional) ----
-        # When --reward_weighted is set, add alpha * (r_chosen - r_rejected) to the
-        # logit inside the sigmoid.  This injects external reward signal directly
-        # into the DPO objective, acting as a data-dependent regulariser.
-        reward_margin = 0.0
-        if args.reward_weighted:
-            r_c = float(ex.get("chosen_reward", 0.0) or 0.0)
-            r_r = float(ex.get("rejected_reward", 0.0) or 0.0)
-            reward_margin = args.reward_alpha * (r_c - r_r)
+    for step in range(1, args.steps + 1):
+        # --- Get batch of pairs ---
+        batch_chosen_ids = []
+        batch_rejected_ids = []
+        batch_prompt_lens = []
+        batch_reward_margins = []
 
-        # ---- Compute loss based on loss_type ----
-        # NOTE: All variants use per-token average log-prob (logp_sequence_avg)
-        # to prevent numerical explosion on long CIF sequences (~560 tokens).
-        if args.loss_type == "simpo":
-            # SimPO (Meng et al. 2024): reference-free, length-normalized average log-prob
-            # Loss: -log σ(β * (avg_logp_chosen - avg_logp_rejected) - γ)
-            # where γ is the reward margin that enforces chosen to be better than rejected by at least γ
-            lp_c = logp_sequence_avg(policy, chosen_ids, len(prompt_ids), args.device)
-            lp_r = logp_sequence_avg(policy, rejected_ids, len(prompt_ids), args.device)
-            adv = lp_c - lp_r
-            # Implementation matches paper: beta * (lp_c - lp_r) - gamma
-            loss = -F.logsigmoid(args.beta * adv - args.simpo_gamma + reward_margin) / args.grad_accum_steps
-        else:
-            # DPO / cDPO: need reference model (using per-token avg log-prob)
-            lp_c = logp_sequence_avg(policy, chosen_ids, len(prompt_ids), args.device)
-            lp_r = logp_sequence_avg(policy, rejected_ids, len(prompt_ids), args.device)
-            with torch.no_grad():
-                lpr_c = logp_sequence_avg(ref, chosen_ids, len(prompt_ids), args.device)
-                lpr_r = logp_sequence_avg(ref, rejected_ids, len(prompt_ids), args.device)
-            adv = (lp_c - lp_r) - (lpr_c - lpr_r)
+        for _ in range(batch_size):
+            ex = next_pair()
+            prompt_ids = encode_text(tokenizer, ex["prompt"] + "\n")
+            chosen_ids = encode_text(tokenizer, ex["prompt"] + "\n" + ex["chosen"])
+            rejected_ids = encode_text(tokenizer, ex["prompt"] + "\n" + ex["rejected"])
+            batch_chosen_ids.append(chosen_ids)
+            batch_rejected_ids.append(rejected_ids)
+            batch_prompt_lens.append(len(prompt_ids))
 
-            if args.loss_type == "cdpo":
-                # cDPO: label-smoothed loss for noisy preferences
-                eps = args.label_smoothing
-                loss = (-(1 - eps) * F.logsigmoid(args.beta * adv + reward_margin)
-                        - eps * F.logsigmoid(-args.beta * adv - reward_margin)) / args.grad_accum_steps
+            rm = 0.0
+            if args.reward_weighted:
+                r_c = float(ex.get("chosen_reward", 0.0) or 0.0)
+                r_r = float(ex.get("rejected_reward", 0.0) or 0.0)
+                rm = args.reward_alpha * (r_c - r_r) / reward_margin_std
+            batch_reward_margins.append(rm)
+
+        reward_margin_t = torch.tensor(batch_reward_margins, device=args.device)
+
+        # --- Compute loss ---
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            if batch_size > 1:
+                lp_c = logp_batch_avg(policy, batch_chosen_ids, batch_prompt_lens, args.device, PAD_ID)
+                lp_r = logp_batch_avg(policy, batch_rejected_ids, batch_prompt_lens, args.device, PAD_ID)
             else:
-                # Standard DPO (optionally reward-weighted)
-                loss = -F.logsigmoid(args.beta * adv + reward_margin) / args.grad_accum_steps
+                lp_c = logp_sequence_avg(policy, batch_chosen_ids[0], batch_prompt_lens[0], args.device).unsqueeze(0)
+                lp_r = logp_sequence_avg(policy, batch_rejected_ids[0], batch_prompt_lens[0], args.device).unsqueeze(0)
 
-        loss.backward()
-        accum_loss += loss.item() * args.grad_accum_steps
-        accum_adv += adv.item()
+            if args.loss_type == "simpo":
+                adv = lp_c - lp_r
+                loss = (-F.logsigmoid(args.beta * adv - args.simpo_gamma + reward_margin_t)).mean()
+            else:
+                with torch.no_grad():
+                    if batch_size > 1:
+                        lpr_c = logp_batch_avg(ref, batch_chosen_ids, batch_prompt_lens, args.device, PAD_ID)
+                        lpr_r = logp_batch_avg(ref, batch_rejected_ids, batch_prompt_lens, args.device, PAD_ID)
+                    else:
+                        lpr_c = logp_sequence_avg(ref, batch_chosen_ids[0], batch_prompt_lens[0], args.device).unsqueeze(0)
+                        lpr_r = logp_sequence_avg(ref, batch_rejected_ids[0], batch_prompt_lens[0], args.device).unsqueeze(0)
+                adv = (lp_c - lp_r) - (lpr_c - lpr_r)
+
+                if args.loss_type == "cdpo":
+                    eps = args.label_smoothing
+                    loss = (-(1 - eps) * F.logsigmoid(args.beta * adv + reward_margin_t)
+                            - eps * F.logsigmoid(-args.beta * adv - reward_margin_t)).mean()
+                else:
+                    loss = (-F.logsigmoid(args.beta * adv + reward_margin_t)).mean()
+
+        scaler.scale(loss / args.grad_accum_steps).backward()
+        accum_loss += loss.item()
+        accum_adv += adv.mean().item()
+        accum_acc += (adv > 0).float().mean().item()
         accum_count += 1
 
         # --- Optimizer step (every grad_accum_steps) ---
         if step % args.grad_accum_steps == 0 or step == args.steps:
-            # LR schedule
             current_lr = cosine_lr(step, args.steps, args.lr, args.warmup_steps)
             for pg in opt.param_groups:
                 pg["lr"] = current_lr
 
-            # Gradient clipping
+            scaler.unscale_(opt)
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm).item()
 
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
             opt.zero_grad()
+            optimizer_steps += 1
 
-            # Log
             avg_loss = accum_loss / accum_count if accum_count else 0
             avg_adv = accum_adv / accum_count if accum_count else 0
+            avg_acc = accum_acc / accum_count if accum_count else 0
             elapsed = time.perf_counter() - t0
 
-            n_tok_c = max(len(chosen_ids) - len(prompt_ids), 1)
-            n_tok_r = max(len(rejected_ids) - len(prompt_ids), 1)
             log_entry = {
                 "step": step,
                 "loss": round(avg_loss, 6),
                 "adv": round(avg_adv, 4),
-                "pi_delta": round((lp_c - lp_r).item(), 4),
+                "accuracy": round(avg_acc, 4),
+                "pi_delta": round((lp_c - lp_r).mean().item(), 4),
                 "lr": current_lr,
                 "grad_norm": round(grad_norm, 4),
                 "epoch": epoch,
                 "elapsed_s": round(elapsed, 1),
-                "n_tok_c": n_tok_c,
-                "n_tok_r": n_tok_r,
             }
             if args.loss_type != "simpo":
-                log_entry["ref_delta"] = round((lpr_c - lpr_r).item(), 4)
+                log_entry["ref_delta"] = round((lpr_c - lpr_r).mean().item(), 4)
             if args.reward_weighted:
-                log_entry["reward_margin"] = round(reward_margin, 4)
+                log_entry["reward_margin"] = round(reward_margin_t.mean().item(), 4)
+
+            if use_val and (optimizer_steps % val_every == 0 or step == args.steps):
+                val_loss = evaluate_val()
+                log_entry["val_loss"] = round(val_loss, 6)
+
             log_fh.write(json.dumps(log_entry) + "\n")
             log_fh.flush()
 
             if step % max(1, args.grad_accum_steps * 10) == 0 or step == args.steps:
-                print(
-                    f"step={step}/{args.steps} loss={avg_loss:.5f} adv={avg_adv:.3f} "
-                    f"lr={current_lr:.2e} gnorm={grad_norm:.3f} epoch={epoch} "
-                    f"[{elapsed:.0f}s]"
-                )
+                msg = (f"step={step}/{args.steps} loss={avg_loss:.5f} adv={avg_adv:.3f} "
+                       f"acc={avg_acc:.3f} lr={current_lr:.2e} gnorm={grad_norm:.3f} "
+                       f"epoch={epoch}")
+                if "val_loss" in log_entry:
+                    msg += f" val={log_entry['val_loss']:.5f}"
+                msg += f" [{elapsed:.0f}s]"
+                print(msg)
 
-            # Track best checkpoint by loss
-            if avg_loss < best_loss:
-                best_loss = avg_loss
+            selection_loss = log_entry.get("val_loss", avg_loss)
+            if selection_loss < best_loss:
+                best_loss = selection_loss
                 best_step = step
                 sd_best = merge_lora_state_dict(policy) if args.strategy == "lora" else policy.state_dict()
                 torch.save({"model_args": ckpt["model_args"], "model": sd_best}, out_dir / "best_ckpt.pt")
 
             accum_loss = 0.0
             accum_adv = 0.0
+            accum_acc = 0.0
             accum_count = 0
 
         # --- Periodic checkpoint ---
@@ -454,10 +580,11 @@ def main():
     log_fh.close()
 
     total_time = time.perf_counter() - t0
+    best_metric = "val_loss" if use_val else "train_loss"
     print(f"\nTraining complete in {total_time:.1f}s")
     print(f"  Final checkpoint: {final_ckpt}")
     if best_step > 0:
-        print(f"  Best checkpoint:  {out_dir / 'best_ckpt.pt'} (step {best_step}, loss {best_loss:.5f})")
+        print(f"  Best checkpoint:  {out_dir / 'best_ckpt.pt'} (step {best_step}, {best_metric}={best_loss:.5f})")
     else:
         print(f"  Best checkpoint:  not saved (no valid loss recorded)")
     print(f"  Training log: {log_file}")
